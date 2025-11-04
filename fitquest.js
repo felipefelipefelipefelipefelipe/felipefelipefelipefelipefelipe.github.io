@@ -1,747 +1,682 @@
-// =====================================================================
-// Configuração e Inicialização do Firebase (Modular Imports v11.6.1)
-// =====================================================================
-import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js';
-import { 
-    getAuth, 
-    signInWithCustomToken, 
-    signInAnonymously, 
-    onAuthStateChanged, 
-    signInWithEmailAndPassword, 
-    signOut 
-} from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
-import { 
-    getFirestore, 
-    doc, 
-    setDoc, 
-    getDoc, 
-    collection, 
-    onSnapshot, 
-    query, 
-    where, 
-    runTransaction, 
-    updateDoc, 
-    deleteDoc, 
-    serverTimestamp,
-    setLogLevel 
-} from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
-
-// --- Variáveis Globais (Fornecidas pelo ambiente Canvas) ---
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'fitquest-default-id';
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+// Configurações e Variáveis Globais (Disponíveis no ambiente Canvas)
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
 const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-// Instâncias
-let app, auth, db, userId = null;
-let isAuthReady = false;
+// Inicializa o Firebase e serviços
+import { initializeApp } from "https://www.gstatic.com/firebasejs/9.6.1/firebase-app-compat.js";
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut, setPersistence, browserSessionPersistence } from "https://www.gstatic.com/firebasejs/9.6.1/firebase-auth-compat.js";
+import { getFirestore, doc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, addDoc, getDoc } from "https://www.gstatic.com/firebasejs/9.6.1/firebase-firestore-compat.js";
+import { setLogLevel } from "https://www.gstatic.com/firebasejs/9.6.1/firebase-firestore-compat.js";
 
-// Variável para callback de confirmação global
-let confirmActionCallback = null;
+// setLogLevel('debug'); // Descomente para debug
+
+let app, auth, db;
+let currentUserId = null;
+let currentRole = null;
+let confirmationResolver = null; // Para gerenciar o modal de confirmação
+
+// --- FIREBASE INITIALIZATION ---
 
 /**
- * Inicializa o app e serviços Firebase.
- * @returns {boolean} Sucesso da inicialização.
+ * Inicializa o Firebase e autentica o usuário.
  */
-function initializeFirebase() {
-    if (!firebaseConfig) {
-        console.error("Firebase Configuração ausente. O app não pode iniciar.");
-        return false;
-    }
-    
-    // Evita reinicialização
-    if (app) return true; 
-
+async function initializeFirebase() {
     try {
         app = initializeApp(firebaseConfig);
         auth = getAuth(app);
         db = getFirestore(app);
+
+        // Define a persistência para 'session' para simular a sessão
+        await setPersistence(auth, browserSessionPersistence);
         
-        // Configura o nível de log para debug
-        setLogLevel('debug'); 
-        return true;
+        // Autentica com o token customizado fornecido pelo Canvas
+        if (initialAuthToken) {
+            await signInWithCustomToken(auth, initialAuthToken);
+        } else {
+            // Fallback para login anônimo se o token não for fornecido
+            await signInAnonymously(auth);
+        }
+
+        // Configura o listener de autenticação
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                currentUserId = user.uid;
+                // Busca o perfil para determinar o papel (Admin ou Aluno)
+                await determineUserRole(user.uid);
+                checkAuthAndRedirect();
+                
+                // Inicializa a UI específica da página
+                if (window.location.pathname.endsWith('admin.html') && currentRole === 'admin') {
+                    renderPendingSubmissions();
+                    renderExistingQuests();
+                    document.getElementById('createQuestForm')?.addEventListener('submit', createQuest);
+                } else if (window.location.pathname.endsWith('aluno.html') && currentRole === 'student') {
+                    renderStudentDashboard();
+                    renderQuests();
+                    document.getElementById('proof-form')?.addEventListener('submit', submitProof);
+                }
+            } else {
+                currentUserId = null;
+                currentRole = null;
+                // Se não autenticado e não estiver na página de login, redireciona
+                if (!window.location.pathname.endsWith('index.html')) {
+                    window.location.href = 'index.html';
+                }
+            }
+        });
+
     } catch (error) {
         console.error("Erro ao inicializar Firebase:", error);
-        return false;
+        showMessage("Erro fatal na inicialização do app.", "error");
     }
 }
 
-// =====================================================================
-// Lógica do Jogo (Gamificação)
-// =====================================================================
-
-// Curva de XP (Base para a lógica de Níveis)
-const XP_CURVE = [
-    { level: 1, name: "Frango", requiredXP: 0 },
-    { level: 2, name: "Iniciante", requiredXP: 100 },
-    { level: 3, name: "Praticante", requiredXP: 400 },
-    { level: 4, name: "Fitness", requiredXP: 900 },
-    { level: 5, name: "Elite", requiredXP: 1700 },
-];
-
 /**
- * Calcula o nível e o progresso do aluno com base no XP total.
- * @param {number} currentXP - XP total do aluno.
- * @returns {{level: number, name: string, progress: number, xpToNext: number, xpRequired: number}}
+ * Determina o papel do usuário (admin ou student)
+ * @param {string} uid ID do usuário
  */
-function calculateLevel(currentXP) {
-    let currentLevel = XP_CURVE[0];
-    let nextLevel = null;
+async function determineUserRole(uid) {
+    // Definimos o Admin por um UID fixo (idealmente, isso viria de um perfil no Firestore)
+    const ADMIN_UID = "admin@fitquest.com"; // Simulação de UID Admin
 
-    for (let i = 0; i < XP_CURVE.length; i++) {
-        if (currentXP >= XP_CURVE[i].requiredXP) {
-            currentLevel = XP_CURVE[i];
-            nextLevel = XP_CURVE[i + 1];
+    if (uid.includes(ADMIN_UID) || (auth.currentUser && auth.currentUser.email === ADMIN_UID)) {
+        currentRole = 'admin';
+    } else {
+        // Para fins de simulação, todos os outros usuários autenticados são alunos
+        currentRole = 'student';
+    }
+
+    // Se o usuário for anônimo (sem token inicial), tentamos buscar o perfil
+    if (auth.currentUser && auth.currentUser.isAnonymous) {
+        // Tenta buscar o perfil do usuário anônimo (fallback seguro)
+        const profileRef = doc(db, getStudentProfilePath(uid));
+        const profileSnap = await getDoc(profileRef);
+        if (profileSnap.exists() && profileSnap.data().role === 'admin') {
+            currentRole = 'admin';
         } else {
-            break;
+            currentRole = 'student';
         }
     }
-
-    if (!nextLevel) {
-        return {
-            level: currentLevel.level,
-            name: currentLevel.name,
-            progress: 100, 
-            xpToNext: 0,
-            xpRequired: currentLevel.requiredXP
-        };
-    }
-
-    const xpForCurrentLevel = currentLevel.requiredXP;
-    const xpNeededForNext = nextLevel.requiredXP - xpForCurrentLevel;
-    const xpEarnedInCurrentLevel = currentXP - xpForCurrentLevel;
-    
-    const progressPercent = Math.min(100, (xpEarnedInCurrentLevel / xpNeededForNext) * 100);
-
-    return {
-        level: currentLevel.level,
-        name: currentLevel.name,
-        progress: progressPercent,
-        xpToNext: nextLevel.requiredXP - currentXP,
-        xpRequired: nextLevel.requiredXP,
-        xpCurrentLevel: xpEarnedInCurrentLevel
-    };
 }
 
-
-// =====================================================================
-// Funções de Utilidade (UI/Mensagens/Confirmação)
-// =====================================================================
+// --- PATH UTILS ---
 
 /**
- * Exibe uma mensagem de notificação (substitui o alert()).
- * @param {string} message - A mensagem a ser exibida.
- * @param {string} type - 'success', 'error', 'info'.
+ * Retorna o path para a coleção pública de Quests.
+ * @returns {string}
  */
-function showMessage(message, type = 'info') {
+function getQuestsCollectionPath() {
+    return `artifacts/${appId}/public/data/quests`;
+}
+
+/**
+ * Retorna o path para a coleção pública de Submissões Pendentes/Aprovadas.
+ * @returns {string}
+ */
+function getSubmissionsCollectionPath() {
+    return `artifacts/${appId}/public/data/submissions`;
+}
+
+/**
+ * Retorna o path para o documento de Perfil do Aluno (privado).
+ * @param {string} uid ID do usuário
+ * @returns {string}
+ */
+function getStudentProfilePath(uid) {
+    return `artifacts/${appId}/users/${uid}/profile/user_data`;
+}
+
+// --- UTILS AND UI ---
+
+/**
+ * Exibe uma mensagem de notificação temporária.
+ * @param {string} message Mensagem a ser exibida.
+ * @param {'success'|'error'|'info'} type Tipo de mensagem para estilização.
+ */
+function showMessage(message, type) {
     const container = document.getElementById('message-container');
     if (!container) return;
 
-    const colorClasses = {
-        'success': 'bg-green-100 border-green-400 text-green-700',
-        'error': 'bg-red-100 border-red-400 text-red-700',
-        'info': 'bg-blue-100 border-blue-400 text-blue-700',
-    };
+    let bgColor, textColor;
+    switch (type) {
+        case 'success':
+            bgColor = 'bg-green-500';
+            textColor = 'text-white';
+            break;
+        case 'error':
+            bgColor = 'bg-red-500';
+            textColor = 'text-white';
+            break;
+        case 'info':
+        default:
+            bgColor = 'bg-indigo-500';
+            textColor = 'text-white';
+            break;
+    }
 
-    const alertDiv = document.createElement('div');
-    alertDiv.className = `fixed top-4 right-4 p-4 border rounded-lg shadow-lg z-50 transition-transform transform translate-x-0 ${colorClasses[type]}`;
-    alertDiv.textContent = message;
+    const alert = document.createElement('div');
+    alert.className = `fixed top-4 right-4 p-4 rounded-lg shadow-xl font-semibold ${bgColor} ${textColor} z-50 transition-opacity duration-300`;
+    alert.textContent = message;
+    container.appendChild(alert);
 
-    container.appendChild(alertDiv);
-
-    // Remove a mensagem após 5 segundos
     setTimeout(() => {
-        alertDiv.classList.add('translate-x-full');
-        alertDiv.addEventListener('transitionend', () => alertDiv.remove());
-    }, 5000);
+        alert.classList.add('opacity-0');
+        alert.addEventListener('transitionend', () => alert.remove());
+    }, 3000);
 }
 
 /**
- * Exibe um modal de confirmação customizado (substitui o confirm()).
- * @param {string} message - A mensagem de confirmação.
- * @param {function} callback - A função a ser executada com o resultado (true/false).
+ * Exibe o modal de confirmação customizado.
+ * @param {string} message Mensagem de confirmação.
+ * @returns {Promise<boolean>} Resolve true se confirmado, false se cancelado.
  */
-function showConfirmModal(message, callback) {
-    const modal = document.getElementById('confirmation-modal');
-    const messageEl = document.getElementById('confirmation-message');
-    if (!modal || !messageEl) {
-        console.error("Confirmation modal UI elements missing. Defaulting to confirm=true.");
-        callback(true);
+function showConfirmationModal(message) {
+    return new Promise(resolve => {
+        confirmationResolver = resolve;
+        document.getElementById('confirmation-message').textContent = message;
+        document.getElementById('confirmation-modal').classList.remove('hidden');
+    });
+}
+
+/**
+ * Resolve o modal de confirmação.
+ * @param {boolean} result Resultado da confirmação (true/false)
+ */
+function handleConfirm(result) {
+    if (confirmationResolver) {
+        confirmationResolver(result);
+        confirmationResolver = null;
+    }
+    document.getElementById('confirmation-modal').classList.add('hidden');
+}
+
+/**
+ * Redireciona o usuário para a página correta com base no papel.
+ */
+function checkAuthAndRedirect() {
+    const path = window.location.pathname;
+    
+    // Usuário na página de login, mas já autenticado
+    if (path.endsWith('index.html') && currentRole) {
+        window.location.href = currentRole === 'admin' ? 'admin.html' : 'aluno.html';
         return;
     }
 
-    messageEl.textContent = message;
-    modal.classList.remove('hidden');
-
-    confirmActionCallback = callback;
-}
-
-/**
- * Lida com o clique nos botões Sim/Não do modal de confirmação.
- * @param {boolean} confirmed - True se 'Sim', False se 'Não'.
- */
-function handleConfirm(confirmed) {
-    const modal = document.getElementById('confirmation-modal');
-    if (modal) modal.classList.add('hidden');
-
-    if (confirmActionCallback) {
-        confirmActionCallback(confirmed);
+    // Usuário no painel de aluno/admin, mas com papel errado
+    if (path.endsWith('admin.html') && currentRole !== 'admin') {
+        window.location.href = 'aluno.html';
+        return;
     }
-    confirmActionCallback = null;
-}
-
-// =====================================================================
-// Funções de Autenticação e Roteamento
-// =====================================================================
-
-/**
- * Função para criar ou atualizar o perfil do usuário no Firestore.
- */
-async function setupUserProfile(user, role) {
-    const userDocRef = doc(db, 'alunos', user.uid);
-    const userDoc = await getDoc(userDocRef);
-    
-    const userData = {
-        nome: user.email ? user.email.split('@')[0] : `Aluno_${user.uid.substring(0, 4)}`,
-        email: user.email || 'anonimo@fitquest.com',
-        XP: 0,
-        role: role,
-        createdAt: serverTimestamp()
-    };
-
-    if (!userDoc.exists()) {
-        await setDoc(userDocRef, userData);
-        showMessage(`Bem-vindo, ${role}! Seu perfil foi criado.`, 'success');
-    } else if (userDoc.data().role !== role) {
-         await updateDoc(userDocRef, { role: role });
-         showMessage(`Papel de usuário atualizado para ${role}!`, 'info');
+    if (path.endsWith('aluno.html') && currentRole !== 'student') {
+        window.location.href = 'admin.html';
+        return;
     }
 }
 
+// --- AUTH LOGIC (LOGIN/LOGOUT) ---
+
 /**
- * Manipula o Login (e-mail/senha) e redireciona.
+ * Tenta fazer login com email e senha.
+ * @param {Event} e 
  */
 async function handleLogin(e) {
     e.preventDefault();
     const email = document.getElementById('email').value;
     const password = document.getElementById('password').value;
     const errorMessage = document.getElementById('error-message');
+
     errorMessage.classList.add('hidden');
 
     try {
-        const userCredential = await signInWithEmailAndPassword(auth, email, password);
-        const uid = userCredential.user.uid;
-        
-        const userDoc = await getDoc(doc(db, 'alunos', uid));
-        const userData = userDoc.data();
-
-        if (userData?.role === 'admin') {
-            window.location.href = 'admin.html';
-        } else {
-            window.location.href = 'aluno.html';
-        }
-
+        await auth.signInWithEmailAndPassword(email, password);
     } catch (error) {
-        console.error("Erro de Login:", error);
-        errorMessage.textContent = `Erro: ${error.message}`;
+        console.error("Erro no login:", error);
+        errorMessage.textContent = "Erro de login: E-mail ou senha inválidos.";
         errorMessage.classList.remove('hidden');
     }
 }
 
 /**
- * Manipula o Logout.
+ * Simula o login de um usuário específico (para ambiente de teste).
+ * @param {string} email Email para simular
+ * @param {string} password Senha para simular
  */
-function handleLogout() {
-    signOut(auth).then(() => {
-        showMessage('Você saiu com sucesso.', 'info');
-        window.location.href = 'index.html';
-    }).catch((error) => {
-        console.error("Erro ao sair:", error);
-        showMessage('Erro ao tentar sair.', 'error');
-    });
+function simulateLogin(email, password) {
+    document.getElementById('email').value = email;
+    document.getElementById('password').value = password;
+    document.getElementById('loginForm').dispatchEvent(new Event('submit'));
 }
 
 /**
- * Configura o login inicial (token ou anônimo).
+ * Realiza o logout do usuário.
  */
-async function setupInitialAuth() {
-    if (!initializeFirebase()) return;
+async function handleLogout() {
+    await signOut(auth);
+    showMessage("Você foi desconectado.", "info");
+    window.location.href = 'index.html';
+}
 
-    if (initialAuthToken) {
-        try {
-            await signInWithCustomToken(auth, initialAuthToken);
-        } catch (error) {
-            console.error("Erro ao logar com token customizado:", error);
-            await signInAnonymously(auth);
-        }
-    } else {
-        if (!auth.currentUser) {
-            await signInAnonymously(auth);
-        }
-    }
+// --- STUDENT DASHBOARD LOGIC (aluno.html) ---
+
+/**
+ * Calcula o nível e XP atual do aluno com base no XP total.
+ * @param {number} totalXP 
+ * @returns {{level: number, xpInLevel: number, xpToNext: number}}
+ */
+function calculateLevel(totalXP) {
+    const xpPerLevel = 100; // Quantidade de XP para subir um nível
+    const level = Math.floor(totalXP / xpPerLevel) + 1;
+    const xpInLevel = totalXP % xpPerLevel;
+    const xpToNext = xpPerLevel - xpInLevel;
+    return { level, xpInLevel, xpToNext, xpPerLevel };
 }
 
 /**
- * Verifica o estado de autenticação e redireciona ou configura o dashboard.
+ * Busca e renderiza os dados do perfil do aluno (nome, nível, XP).
  */
-function checkAuthAndRedirect() {
-    if (!initializeFirebase()) return;
-    
-    // Ouve as mudanças de estado de autenticação
-    onAuthStateChanged(auth, async (user) => {
-        if (!user) {
-            // Se não está logado, garante que está na tela de login
-            if (document.title.includes('Dashboard Aluno') || document.title.includes('Painel Admin')) {
-                window.location.href = 'index.html';
-            }
-            return;
+async function renderStudentDashboard() {
+    if (!currentUserId) return;
+
+    const profileRef = doc(db, getStudentProfilePath(currentUserId));
+
+    onSnapshot(profileRef, async (docSnap) => {
+        let profile = { name: "Novo Aluno", totalXP: 0 };
+        
+        if (!docSnap.exists()) {
+            // Cria um perfil inicial se não existir
+            await setDoc(profileRef, profile, { merge: true });
+        } else {
+            profile = docSnap.data();
         }
 
-        userId = user.uid;
-        isAuthReady = true;
+        const { level, xpInLevel, xpToNext, xpPerLevel } = calculateLevel(profile.totalXP || 0);
 
-        // Recupera o perfil do usuário
-        const userDoc = await getDoc(doc(db, 'alunos', userId));
-        const userData = userDoc.data();
-        const currentPath = window.location.pathname;
-        const isAdmin = userData?.role === 'admin';
+        // Atualiza a UI
+        document.getElementById('student-name').textContent = profile.name;
+        document.getElementById('student-level').textContent = `Lvl ${level}`;
+        document.getElementById('student-xp').textContent = `${xpInLevel} / ${xpPerLevel} XP`;
         
-        // Redirecionamento forçado para a página correta
-        if (isAdmin && !currentPath.includes('admin.html')) {
-            window.location.href = 'admin.html';
-            return;
-        }
-        if (!isAdmin && !currentPath.includes('aluno.html') && !currentPath.includes('index.html')) {
-            window.location.href = 'aluno.html';
-            return;
-        }
-
-        // Se o usuário está na página correta, carrega o dashboard
-        if (currentPath.includes('admin.html') && isAdmin) {
-            renderAdminDashboard();
-        } else if (currentPath.includes('aluno.html') && !isAdmin) {
-            renderStudentDashboard();
-        }
-    });
-}
-
-/**
- * Simula o login como aluno e cria o perfil se necessário.
- */
-async function simulateStudentLogin() {
-    await setupInitialAuth();
-    if (!auth.currentUser) return;
-    
-    await setupUserProfile(auth.currentUser, 'aluno');
-    window.location.href = 'aluno.html';
-}
-
-/**
- * Simula o login como admin e cria o perfil se necessário.
- */
-async function simulateAdminLogin() {
-    await setupInitialAuth();
-    if (!auth.currentUser) return;
-    
-    await setupUserProfile(auth.currentUser, 'admin');
-    window.location.href = 'admin.html';
-}
-
-// =====================================================================
-// Funções do Aluno (aluno.html)
-// =====================================================================
-
-let currentQuestForSubmission = null;
-
-function renderStudentDashboard() {
-    if (!db || !userId) return;
-
-    onSnapshot(doc(db, 'alunos', userId), docSnapshot => {
-        if (!docSnapshot.exists()) return;
-        const userData = docSnapshot.data();
-        const studentXP = userData.XP || 0;
-        
-        const { level, name, progress, xpToNext, xpRequired } = calculateLevel(studentXP);
-        
-        document.getElementById('student-name').textContent = `Olá, ${userData.nome}!`;
-        document.getElementById('student-level').textContent = name;
-        document.getElementById('student-xp').textContent = `${studentXP} / ${xpRequired} XP`;
-        
+        const progressPercentage = (xpInLevel / xpPerLevel) * 100;
         const progressBar = document.getElementById('progress-bar');
-        if(progressBar) progressBar.style.width = `${progress}%`;
-        
-        renderQuests(userId);
+        progressBar.style.width = `${progressPercentage}%`;
+        progressBar.setAttribute('aria-valuenow', progressPercentage);
     });
 }
 
-function renderQuests(currentUserId) {
-    if (!db) return;
+/**
+ * Busca e renderiza as Quests disponíveis para o aluno.
+ */
+function renderQuests() {
+    const questsList = document.getElementById('quests-list');
+    const questsRef = collection(db, getQuestsCollectionPath());
+    
+    // Escuta em tempo real as Quests
+    onSnapshot(questsRef, (snapshot) => {
+        if (!currentUserId) return;
 
-    const questsListEl = document.getElementById('quests-list');
-    if (questsListEl) questsListEl.innerHTML = '<p class="p-4 bg-blue-100 rounded-lg text-blue-800">Buscando Quests...</p>';
+        let html = '';
+        if (snapshot.empty) {
+            html = '<p class="p-6 bg-yellow-100 rounded-xl text-yellow-800 font-medium">Nenhuma Quest disponível no momento. Fale com seu Admin!</p>';
+        } else {
+            snapshot.docs.forEach(questDoc => {
+                const quest = questDoc.data();
+                const questId = questDoc.id;
 
-    onSnapshot(collection(db, 'public', appId, 'data', 'quests', 'list'), questsSnapshot => {
-        
-        onSnapshot(collection(db, 'alunos', currentUserId, 'submissoes'), submissionsSnapshot => {
-            
-            const submissions = {};
-            submissionsSnapshot.forEach(doc => {
-                const data = doc.data();
-                submissions[data.questId] = data.status;
-            });
+                // Aqui precisaríamos de uma lógica mais complexa para verificar se o aluno já completou/submeteu
+                // Por simplicidade, assumimos que todas as quests estão disponíveis.
 
-            if (questsListEl) questsListEl.innerHTML = '';
-
-            if (questsSnapshot.empty) {
-                if (questsListEl) questsListEl.innerHTML = '<p class="p-4 bg-gray-200 rounded-lg text-gray-700">Nenhuma Quest ativa no momento.</p>';
-                return;
-            }
-
-            questsSnapshot.forEach(doc => {
-                const quest = doc.data();
-                const questId = doc.id;
-                const status = submissions[questId] || 'pendente_aluno'; 
-                
-                let buttonHtml = '';
-                let statusText = '';
-                let statusColor = '';
-                
-                if (status === 'aprovado') {
-                    statusText = '✅ COMPLETA!';
-                    statusColor = 'bg-green-100 border-green-500';
-                    buttonHtml = '<button disabled class="px-4 py-2 bg-gray-400 text-white rounded-lg opacity-50 cursor-not-allowed">Concluída</button>';
-                } else if (status === 'pendente_admin') {
-                    statusText = '⏳ AGUARDANDO APROVAÇÃO';
-                    statusColor = 'bg-yellow-100 border-yellow-500';
-                    buttonHtml = '<button disabled class="px-4 py-2 bg-yellow-500 text-white rounded-lg opacity-75 cursor-not-allowed">Em Revisão</button>';
-                } else if (status === 'rejeitado') {
-                    statusText = '❌ REJEITADA. Envie Novamente.';
-                    statusColor = 'bg-red-100 border-red-500';
-                    buttonHtml = `<button onclick="window.fitquest.showProofModal('${questId}', '${quest.validationType}')" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition">Enviar Prova</button>`;
-                } else { // pendente_aluno
-                     statusText = `⭐ ${quest.XP} XP de Recompensa`;
-                     statusColor = 'bg-white border-gray-300';
-                     buttonHtml = `<button onclick="window.fitquest.showProofModal('${questId}', '${quest.validationType}')" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition">Concluir e Enviar Prova</button>`;
-                }
-
-                const questCard = `
-                    <div class="p-5 border-l-4 ${statusColor} rounded-xl shadow-md flex justify-between items-center transition hover:shadow-lg">
-                        <div class="flex-1">
-                            <h4 class="text-lg font-bold text-gray-800">${quest.name}</h4>
-                            <p class="text-sm text-gray-600 mb-2">${quest.description}</p>
-                            <span class="text-xs font-semibold ${status === 'aprovado' ? 'text-green-700' : status === 'pendente_admin' ? 'text-yellow-700' : 'text-gray-500'}">${statusText}</span>
+                html += `
+                    <div class="bg-white p-6 rounded-xl shadow-lg border-l-4 border-green-500">
+                        <div class="flex justify-between items-start">
+                            <h4 class="text-xl font-bold text-gray-800">${quest.name}</h4>
+                            <span class="text-sm font-bold bg-green-100 text-green-700 px-3 py-1 rounded-full">+${quest.xp} XP</span>
                         </div>
-                        <div>
-                           ${buttonHtml}
+                        <p class="text-gray-600 mt-2 mb-4">${quest.description}</p>
+                        <div class="flex justify-between items-center text-sm">
+                            <span class="text-gray-500">Prova: ${quest.validationType}</span>
+                            <button 
+                                onclick="window.fitquest.openProofModal('${questId}', '${quest.name}', '${quest.validationType}')"
+                                class="bg-green-600 text-white px-4 py-2 rounded-lg font-semibold hover:bg-green-700 transition"
+                            >
+                                Enviar Prova
+                            </button>
                         </div>
                     </div>
                 `;
-                if (questsListEl) questsListEl.innerHTML += questCard;
             });
-        });
-    });
-}
-
-function showProofModal(questId, validationType) {
-    currentQuestForSubmission = { questId, validationType };
-    
-    const modal = document.getElementById('proof-modal');
-    const title = document.getElementById('modal-title');
-    const label = document.getElementById('proof-label');
-    const input = document.getElementById('proof-input');
-
-    if (modal) modal.classList.remove('hidden');
-    if (title) title.textContent = "Enviar Prova";
-    if (input) input.type = 'text'; 
-    
-    if (validationType === 'QR-Code') {
-        if (label) label.textContent = "Código QR da Recepção:";
-        if (input) input.placeholder = "Insira o código de validação...";
-    } else if (validationType === 'Foto') {
-        if (label) label.textContent = "URL da Foto/Vídeo (Painel da Esteira, etc.):";
-        if (input) input.placeholder = "Ex: https://i.imgur.com/minha-foto.jpg";
-    } else { // Manual
-        if (label) label.textContent = "Observações para o Admin (Opcional):";
-        if (input) input.placeholder = "Mensagem para o Ricardo...";
-    }
-}
-
-function closeProofModal() {
-    const modal = document.getElementById('proof-modal');
-    const form = document.getElementById('proof-form');
-    if (modal) modal.classList.add('hidden');
-    if (form) form.reset();
-    currentQuestForSubmission = null;
-}
-
-async function handleProofSubmission(e) {
-    e.preventDefault();
-    if (!userId || !currentQuestForSubmission) return;
-
-    const proofInput = document.getElementById('proof-input');
-    const proofValue = proofInput ? proofInput.value : '';
-    const { questId, validationType } = currentQuestForSubmission;
-
-    const submissionData = {
-        alunoId: userId,
-        questId: questId,
-        proofValue: proofValue,
-        proofType: validationType,
-        status: 'pendente_admin', 
-        submittedAt: serverTimestamp()
-    };
-
-    try {
-        const studentSubmissionsRef = collection(db, 'alunos', userId, 'submissoes');
-        
-        const q = query(studentSubmissionsRef, where('questId', '==', questId));
-        const existingSubmissionQuery = await getDocs(q);
-
-        if (!existingSubmissionQuery.empty) {
-            const docRef = existingSubmissionQuery.docs[0].ref;
-            await updateDoc(docRef, submissionData);
-        } else {
-            await setDoc(doc(studentSubmissionsRef), submissionData);
         }
-        
-        showMessage('Prova enviada com sucesso! Aguarde a aprovação do Ricardo.', 'success');
-        closeProofModal();
-    } catch (error) {
-        console.error("Erro ao enviar prova:", error);
-        showMessage('Erro ao enviar prova. Tente novamente.', 'error');
-    }
-}
-
-
-// =====================================================================
-// Funções do Admin (admin.html)
-// =====================================================================
-
-let allQuestsData = {};
-
-function renderAdminDashboard() {
-    if (!db) return;
-
-    onSnapshot(collection(db, 'public', appId, 'data', 'quests', 'list'), snapshot => {
-        allQuestsData = {};
-        snapshot.forEach(doc => {
-            allQuestsData[doc.id] = doc.data();
-        });
-        renderQuestsList(); 
-        renderSubmissions();
+        questsList.innerHTML = html;
     });
 }
 
-function renderQuestsList() {
-    const listEl = document.getElementById('existing-quests-list');
-    if (!listEl) return;
-    listEl.innerHTML = '';
+let activeQuestId = null;
+let activeValidationType = null;
+
+/**
+ * Abre o modal para submissão de prova.
+ * @param {string} questId ID da Quest
+ * @param {string} questName Nome da Quest
+ * @param {string} validationType Tipo de prova
+ */
+function openProofModal(questId, questName, validationType) {
+    activeQuestId = questId;
+    activeValidationType = validationType;
     
-    if (Object.keys(allQuestsData).length === 0) {
-        listEl.innerHTML = '<p class="text-gray-500">Nenhuma Quest foi criada ainda.</p>';
+    const modalTitle = document.getElementById('modal-title');
+    const proofLabel = document.getElementById('proof-label');
+    const proofInput = document.getElementById('proof-input');
+    const proofModal = document.getElementById('proof-modal');
+
+    modalTitle.textContent = `Enviar Prova: ${questName}`;
+    
+    let placeholder = 'Insira o valor da prova aqui...';
+
+    if (validationType === 'QR-Code') {
+        proofLabel.textContent = 'Código QR ou Chave de Validação';
+        placeholder = 'Ex: 1A2B3C';
+    } else if (validationType === 'Foto') {
+        proofLabel.textContent = 'URL da Foto ou Vídeo de Prova';
+        placeholder = 'Ex: https://link.para/sua/foto.jpg';
+    } else if (validationType === 'Manual') {
+        proofLabel.textContent = 'Comentário/Nota para o Admin';
+        placeholder = 'Ex: Completei 1 hora de yoga hoje.';
+    }
+
+    proofInput.setAttribute('placeholder', placeholder);
+    proofModal.classList.remove('hidden');
+}
+
+/**
+ * Fecha o modal de prova.
+ */
+function closeProofModal() {
+    document.getElementById('proof-modal').classList.add('hidden');
+    document.getElementById('proof-form').reset();
+    activeQuestId = null;
+    activeValidationType = null;
+}
+
+/**
+ * Submete a prova da quest para aprovação do Admin.
+ * @param {Event} e 
+ */
+async function submitProof(e) {
+    e.preventDefault();
+    if (!activeQuestId || !currentUserId) return;
+
+    const proofValue = document.getElementById('proof-input').value.trim();
+    
+    if (!proofValue) {
+        showMessage("O valor da prova não pode ser vazio.", "error");
         return;
     }
-    
-    Object.keys(allQuestsData).forEach(id => {
-        const quest = allQuestsData[id];
-        const item = document.createElement('div');
-        item.className = 'p-3 border-b border-gray-100 flex justify-between items-center';
-        item.innerHTML = `
-            <div>
-                <p class="font-semibold text-gray-800">${quest.name} (${quest.XP} XP)</p>
-                <p class="text-xs text-gray-500">Validação: ${quest.validationType} | ${quest.description.substring(0, 40)}...</p>
-            </div>
-            <button onclick="window.fitquest.deleteQuest('${id}')" class="text-red-500 hover:text-red-700 text-sm">Excluir</button>
-        `;
-        listEl.appendChild(item);
-    });
-}
 
-async function deleteQuest(questId) {
-    // Substituindo o confirm() nativo por um modal customizado
-     showConfirmModal(`Tem certeza que deseja excluir a Quest "${allQuestsData[questId].name}"?`, async (confirmed) => {
-        if (!confirmed) return;
-
-        try {
-            await deleteDoc(doc(db, 'public', appId, 'data', 'quests', 'list', questId));
-            showMessage('Quest excluída com sucesso!', 'success');
-        } catch (error) {
-            console.error("Erro ao excluir Quest:", error);
-            showMessage('Erro ao excluir Quest.', 'error');
-        }
-    });
-}
-
-function renderSubmissions() {
-    const listEl = document.getElementById('pending-submissions-list');
-    if (!listEl) return;
-    listEl.innerHTML = ''; 
-
-    getDocs(collection(db, 'alunos')).then(alunosSnapshot => {
-        if (alunosSnapshot.empty) {
-            listEl.innerHTML = '<p class="p-4 bg-gray-200 rounded-lg text-gray-700">Nenhum aluno cadastrado para verificar submissões.</p>';
+    try {
+        const questRef = doc(db, getQuestsCollectionPath(), activeQuestId);
+        const questSnap = await getDoc(questRef);
+        
+        if (!questSnap.exists()) {
+            showMessage("Quest não encontrada. Tente novamente.", "error");
+            closeProofModal();
             return;
         }
 
-        let pendingCount = 0;
-        listEl.innerHTML = ''; 
+        const questData = questSnap.data();
 
-        alunosSnapshot.forEach(alunoDoc => {
-            const alunoId = alunoDoc.id;
-            const alunoData = alunoDoc.data();
-            const alunoNome = alunoData.nome || (alunoData.email ? alunoData.email.split('@')[0] : 'Nome Indisponível');
-
-            onSnapshot(query(collection(db, 'alunos', alunoId, 'submissoes'), where('status', '==', 'pendente_admin')), submissionsSnapshot => {
-                
-                // Clear and re-render only the submissions for this specific student to avoid duplication
-                const existingItems = Array.from(listEl.children);
-                existingItems.filter(item => item.dataset.alunoid === alunoId).forEach(item => item.remove());
-
-                submissionsSnapshot.forEach(subDoc => {
-                    const submission = subDoc.data();
-                    const submissionId = subDoc.id;
-                    const questInfo = allQuestsData[submission.questId] || { name: 'Quest Desconhecida', XP: '??' };
-                    
-                    pendingCount++;
-
-                    const item = document.createElement('div');
-                    item.className = 'bg-white p-4 rounded-xl shadow-lg border-l-4 border-yellow-500 space-y-2';
-                    item.dataset.alunoid = alunoId; // Marca para limpeza
-                    item.innerHTML = `
-                        <p class="font-bold text-lg text-gray-800">${questInfo.name} <span class="text-sm font-normal text-gray-500">(${questInfo.XP} XP)</span></p>
-                        <p class="text-sm text-gray-600">Aluno: ${alunoNome}</p>
-                        <p class="text-sm text-gray-600">Prova (${submission.proofType}): <span class="font-semibold text-indigo-600 break-all">${submission.proofValue}</span></p>
-                        <div class="flex space-x-3 pt-2">
-                            <button onclick="window.fitquest.handleApproveSubmission('${alunoId}', '${submissionId}', ${questInfo.XP})" class="flex-1 bg-green-500 text-white py-2 rounded-lg text-sm font-semibold hover:bg-green-600 transition">Aprovar XP</button>
-                            <button onclick="window.fitquest.handleRejectSubmission('${alunoId}', '${submissionId}')" class="flex-1 bg-red-500 text-white py-2 rounded-lg text-sm font-semibold hover:bg-red-600 transition">Rejeitar</button>
-                        </div>
-                    `;
-                    listEl.appendChild(item);
-                });
-
-                // Esta lógica de contagem é um pouco complexa devido ao onSnapshot aninhado.
-                // A maneira mais simples de garantir a mensagem 'Nenhuma submissão pendente'
-                // é verificar se a lista está vazia após o processamento de TODOS os alunos.
-                // Aqui, apenas garantimos que a submissão pendente está sendo renderizada.
-                // A mensagem 'Nenhuma submissão pendente' será tratada de forma simples no final se a lista estiver vazia.
-            });
+        // Salva a submissão para o Admin aprovar
+        await addDoc(collection(db, getSubmissionsCollectionPath()), {
+            questId: activeQuestId,
+            questName: questData.name,
+            questXP: questData.xp,
+            studentId: currentUserId,
+            proofValue: proofValue,
+            validationType: activeValidationType,
+            submittedAt: new Date().toISOString(),
+            status: 'pending' // pending, approved, rejected
         });
 
-        // Este timeout é um hack para dar tempo ao onSnapshot aninhado
-        // de preencher a lista antes de verificar se está vazia.
-        setTimeout(() => {
-             if (listEl.children.length === 0) {
-                 listEl.innerHTML = '<p class="p-4 bg-green-100 rounded-lg text-green-700">🎉 Nenhuma submissão pendente de aprovação!</p>';
-             }
-        }, 500);
-    });
+        showMessage("Prova enviada com sucesso! Aguardando aprovação do Admin.", "success");
+        closeProofModal();
+
+    } catch (error) {
+        console.error("Erro ao submeter prova:", error);
+        showMessage("Erro ao enviar prova. Tente novamente.", "error");
+    }
 }
 
-async function handleCreateQuest(e) {
+// --- ADMIN DASHBOARD LOGIC (admin.html) ---
+
+/**
+ * Cria uma nova Quest no Firestore.
+ * @param {Event} e 
+ */
+async function createQuest(e) {
     e.preventDefault();
     
-    const name = document.getElementById('quest-name').value;
-    const description = document.getElementById('quest-description').value;
+    const name = document.getElementById('quest-name').value.trim();
+    const description = document.getElementById('quest-description').value.trim();
     const xp = parseInt(document.getElementById('quest-xp').value, 10);
     const validationType = document.getElementById('quest-validation-type').value;
 
-    const newQuest = {
-        name,
-        description,
-        XP: xp,
-        validationType,
-        createdAt: serverTimestamp()
-    };
+    if (!name || !description || isNaN(xp) || xp <= 0) {
+        showMessage("Preencha todos os campos corretamente.", "error");
+        return;
+    }
 
     try {
-        await setDoc(doc(collection(db, 'public', appId, 'data', 'quests', 'list')), newQuest);
-        
-        showMessage(`Quest "${name}" criada com sucesso!`, 'success');
+        await addDoc(collection(db, getQuestsCollectionPath()), {
+            name,
+            description,
+            xp,
+            validationType,
+            createdAt: new Date().toISOString()
+        });
+
+        showMessage("Quest criada com sucesso!", "success");
         document.getElementById('createQuestForm').reset();
     } catch (error) {
-        console.error("Erro ao criar Quest:", error);
-        showMessage('Erro ao criar Quest. Verifique as permissões.', 'error');
+        console.error("Erro ao criar quest:", error);
+        showMessage("Erro ao salvar Quest no banco de dados.", "error");
     }
 }
 
-async function handleApproveSubmission(alunoId, submissionId, rewardXP) {
-    const submissionRef = doc(db, 'alunos', alunoId, 'submissoes', submissionId);
+/**
+ * Renderiza a lista de Quests existentes no painel Admin.
+ */
+function renderExistingQuests() {
+    const listElement = document.getElementById('existing-quests-list');
+    const questsRef = collection(db, getQuestsCollectionPath());
     
-    await updateDoc(submissionRef, { 
-        status: 'aprovado',
-        approvedAt: serverTimestamp()
+    onSnapshot(questsRef, (snapshot) => {
+        let html = '';
+        if (snapshot.empty) {
+            html = '<p class="text-gray-500">Nenhuma Quest criada ainda.</p>';
+        } else {
+            snapshot.docs.forEach(questDoc => {
+                const quest = questDoc.data();
+                
+                html += `
+                    <div class="flex justify-between items-center p-3 border-b border-gray-100 last:border-b-0">
+                        <div>
+                            <p class="font-semibold text-gray-800">${quest.name} (<span class="text-indigo-600">+${quest.xp} XP</span>)</p>
+                            <p class="text-xs text-gray-500">${quest.validationType}</p>
+                        </div>
+                        <button 
+                            onclick="window.fitquest.deleteQuest('${questDoc.id}')"
+                            class="text-red-500 hover:text-red-700 transition"
+                            title="Deletar Quest"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                              <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.723-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 10-2 0v6a1 1 0 102 0V8z" clip-rule="evenodd" />
+                            </svg>
+                        </button>
+                    </div>
+                `;
+            });
+        }
+        listElement.innerHTML = html;
     });
+}
 
-    const alunoRef = doc(db, 'alunos', alunoId);
+/**
+ * Deleta uma Quest por ID.
+ * @param {string} questId 
+ */
+async function deleteQuest(questId) {
+    const confirmed = await showConfirmationModal("Tem certeza que deseja deletar esta Quest? Isso é irreversível.");
+    if (!confirmed) return;
+
     try {
-        await runTransaction(db, async (transaction) => {
-            const alunoDoc = await transaction.get(alunoRef);
-            if (!alunoDoc.exists()) {
-                throw "Aluno não existe!";
-            }
-            const newXP = (alunoDoc.data().XP || 0) + rewardXP;
-            transaction.update(alunoRef, { XP: newXP });
-        });
-        showMessage(`Submissão aprovada! ${rewardXP} XP adicionado ao aluno!`, 'success');
+        await deleteDoc(doc(db, getQuestsCollectionPath(), questId));
+        showMessage("Quest deletada com sucesso.", "success");
     } catch (error) {
-        console.error("Erro na transação de XP:", error);
-        showMessage(`Submissão aprovada, mas houve erro ao conceder XP.`, 'error');
+        console.error("Erro ao deletar quest:", error);
+        showMessage("Erro ao deletar Quest.", "error");
     }
 }
 
-async function handleRejectSubmission(alunoId, submissionId) {
-    const submissionRef = doc(db, 'alunos', alunoId, 'submissoes', submissionId);
+/**
+ * Renderiza a fila de submissões pendentes.
+ */
+function renderPendingSubmissions() {
+    const listElement = document.getElementById('pending-submissions-list');
+    const submissionsRef = collection(db, getSubmissionsCollectionPath());
     
+    // Query: Apenas submissões com status 'pending'
+    const q = query(submissionsRef, where("status", "==", "pending"));
+
+    onSnapshot(q, async (snapshot) => {
+        let html = '';
+        if (snapshot.empty) {
+            html = '<p class="p-6 bg-green-100 rounded-xl text-green-700 font-medium">Nenhuma submissão pendente. Tudo certo! 🎉</p>';
+        } else {
+            const promises = snapshot.docs.map(async subDoc => {
+                const sub = subDoc.data();
+                const submissionId = subDoc.id;
+                
+                // Busca o nome do aluno (pode ser anônimo no início)
+                let studentName = `Aluno ${sub.studentId.substring(0, 8)}...`;
+                // Poderíamos buscar o nome do perfil aqui, mas para simplificar, usaremos o ID parcial
+                // const profileSnap = await getDoc(doc(db, getStudentProfilePath(sub.studentId)));
+                // if (profileSnap.exists()) { studentName = profileSnap.data().name || studentName; }
+                
+                let proofDisplay;
+                if (sub.validationType === 'Foto') {
+                    proofDisplay = `<a href="${sub.proofValue}" target="_blank" class="text-indigo-600 hover:underline font-medium break-all">Ver Prova (Link)</a>`;
+                } else {
+                    proofDisplay = `<span class="font-mono bg-gray-100 p-1 rounded text-sm text-gray-700">${sub.proofValue}</span>`;
+                }
+                
+                return `
+                    <div class="bg-white p-5 rounded-xl shadow-lg border-l-4 border-red-500">
+                        <div class="flex justify-between items-start mb-2">
+                            <h4 class="text-xl font-bold text-gray-800">${sub.questName}</h4>
+                            <span class="text-sm font-bold bg-indigo-100 text-indigo-700 px-3 py-1 rounded-full">+${sub.questXP} XP</span>
+                        </div>
+                        <p class="text-sm text-gray-500 mb-3">Aluno ID: <span class="font-mono text-gray-700">${sub.studentId}</span></p>
+                        <p class="text-gray-600 mb-4">Prova: ${proofDisplay}</p>
+                        
+                        <div class="flex space-x-3">
+                            <button 
+                                onclick="window.fitquest.approveSubmission('${submissionId}', '${sub.studentId}', ${sub.questXP})"
+                                class="flex-1 bg-green-600 text-white py-2 rounded-lg font-semibold text-sm hover:bg-green-700 transition"
+                            >
+                                Aprovar
+                            </button>
+                            <button 
+                                onclick="window.fitquest.rejectSubmission('${submissionId}')"
+                                class="flex-1 bg-red-600 text-white py-2 rounded-lg font-semibold text-sm hover:bg-red-700 transition"
+                            >
+                                Rejeitar
+                            </button>
+                        </div>
+                    </div>
+                `;
+            });
+
+            // Converte o array de Promises em uma string HTML
+            html = (await Promise.all(promises)).join('');
+        }
+        listElement.innerHTML = html;
+    });
+}
+
+/**
+ * Aprova uma submissão, concedendo XP ao aluno.
+ * @param {string} submissionId ID da submissão
+ * @param {string} studentId ID do aluno
+ * @param {number} xp XP a ser concedido
+ */
+async function approveSubmission(submissionId, studentId, xp) {
+    const confirmed = await showConfirmationModal(`Conceder ${xp} XP ao aluno?`);
+    if (!confirmed) return;
+
     try {
-        await updateDoc(submissionRef, { 
-            status: 'rejeitado',
-            rejectedAt: serverTimestamp()
+        const studentProfileRef = doc(db, getStudentProfilePath(studentId));
+        const submissionRef = doc(db, getSubmissionsCollectionPath(), submissionId);
+
+        // 1. Atualiza o XP do aluno (uso de transação seria ideal, mas simplificado aqui)
+        await updateDoc(studentProfileRef, {
+            totalXP: getDoc(studentProfileRef).then(doc => (doc.data()?.totalXP || 0) + xp) // Adiciona o XP
         });
-        showMessage('Submissão rejeitada. O aluno pode tentar novamente.', 'info');
+        
+        // 2. Marca a submissão como aprovada
+        await updateDoc(submissionRef, { status: 'approved', approvedAt: new Date().toISOString() });
+        
+        showMessage(`Submissão aprovada! ${xp} XP concedidos ao aluno.`, "success");
+    } catch (error) {
+        console.error("Erro ao aprovar submissão:", error);
+        showMessage("Erro ao processar aprovação.", "error");
+    }
+}
+
+/**
+ * Rejeita uma submissão.
+ * @param {string} submissionId ID da submissão
+ */
+async function rejectSubmission(submissionId) {
+    const confirmed = await showConfirmationModal("Tem certeza que deseja rejeitar esta submissão?");
+    if (!confirmed) return;
+
+    try {
+        const submissionRef = doc(db, getSubmissionsCollectionPath(), submissionId);
+        
+        // Marca a submissão como rejeitada
+        await updateDoc(submissionRef, { status: 'rejected', rejectedAt: new Date().toISOString() });
+        
+        showMessage("Submissão rejeitada. O aluno foi notificado.", "info"); // Nota: Notificação não implementada
     } catch (error) {
         console.error("Erro ao rejeitar submissão:", error);
-        showMessage('Erro ao rejeitar submissão.', 'error');
+        showMessage("Erro ao processar rejeição.", "error");
     }
 }
 
 
-// =====================================================================
-// Inicialização e Listeners Globais
-// =====================================================================
+// --- MAIN EXECUTION AND EXPOSURE ---
 
-// Expor funções necessárias para uso no onclick (aluno.html e admin.html)
-window.fitquest = {
-    showProofModal,
-    closeProofModal,
-    handleLogout,
-    deleteQuest,
-    handleApproveSubmission,
-    handleRejectSubmission,
-    // Novas funções de confirmação
-    handleConfirm
-};
+// Inicializa o Firebase e o listener de autenticação
+initializeFirebase();
 
-// Adicionar listeners APENAS quando o DOM estiver carregado (padrão de módulo)
+// Adiciona event listeners para a página de login, se aplicável
 document.addEventListener('DOMContentLoaded', () => {
-    // 1. Listeners de Login (index.html)
-    if (document.getElementById('loginForm')) {
-        document.getElementById('loginForm').addEventListener('submit', handleLogin);
-        document.getElementById('simulateStudentLogin').addEventListener('click', simulateStudentLogin);
-        document.getElementById('simulateAdminLogin').addEventListener('click', simulateAdminLogin);
-    }
-    
-    // 2. Listeners de Dashboards (admin.html e aluno.html)
-    if (document.title.includes('Dashboard Aluno') || document.title.includes('Painel Admin')) {
-        // Inicia a verificação de autenticação e o carregamento do dashboard
-        checkAuthAndRedirect();
-    }
-
-    // 3. Listener de Criação de Quest (admin.html)
-    if (document.getElementById('createQuestForm')) {
-        document.getElementById('createQuestForm').addEventListener('submit', handleCreateQuest);
-    }
-
-    // 4. Listener de Envio de Prova (aluno.html)
-    if (document.getElementById('proof-form')) {
-        document.getElementById('proof-form').addEventListener('submit', handleProofSubmission);
+    if (window.location.pathname.endsWith('index.html')) {
+        document.getElementById('loginForm')?.addEventListener('submit', handleLogin);
+        document.getElementById('simulateStudentLogin')?.addEventListener('click', () => simulateLogin('aluno@fitquest.com', '123456'));
+        document.getElementById('simulateAdminLogin')?.addEventListener('click', () => simulateLogin('admin@fitquest.com', '123456'));
     }
 });
+
+// Expõe funções públicas para acesso via HTML (onclick)
+window.fitquest = {
+    handleLogout,
+    handleConfirm, // Para o modal de confirmação
+    // Student functions
+    openProofModal,
+    closeProofModal,
+    // Admin functions
+    createQuest,
+    deleteQuest,
+    approveSubmission,
+    rejectSubmission
+};
