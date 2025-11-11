@@ -587,7 +587,7 @@ initializeFirebase();
 
 // Adiciona event listeners para a página de login, se aplicável
 document.addEventListener('DOMContentLoaded', () => {
-    if (window.location.pathname.endsWith('index.html')) {
+if (window.location.pathname.endsWith('index.html') || window.location.pathname.endsWith('/')) {
         // Se o elemento existe, adiciona o listener
         document.getElementById('loginForm')?.addEventListener('submit', handleLogin);
         // Correção: Garantir que os IDs dos botões estejam corretos e chamem a função simulateLogin
