@@ -30,13 +30,22 @@ async function initializeFirebase() {
         // Define a persistência para 'session' para simular a sessão
         await setPersistence(auth, browserSessionPersistence);
         
-        // Autentica com o token customizado fornecido pelo Canvas
+        // Tenta autenticar com o token customizado fornecido pelo Canvas
+        let authAttempted = false;
         if (initialAuthToken) {
-            await signInWithCustomToken(auth, initialAuthToken);
-        } else {
-            // Fallback para login anônimo se o token não for fornecido
-            await signInAnonymously(auth);
+            try {
+                await signInWithCustomToken(auth, initialAuthToken);
+                authAttempted = true;
+            } catch (e) {
+                console.warn("Falha na autenticação com Custom Token. Tentando login anônimo.", e);
+            }
         }
+        
+        if (!authAttempted) {
+             // Fallback para login anônimo se o token não for fornecido ou falhar
+             await signInAnonymously(auth);
+        }
+
 
         // Configura o listener de autenticação
         onAuthStateChanged(auth, async (user) => {
@@ -52,6 +61,7 @@ async function initializeFirebase() {
                     renderExistingQuests();
                     document.getElementById('createQuestForm')?.addEventListener('submit', createQuest);
                 } else if (window.location.pathname.endsWith('aluno.html') && currentRole === 'student') {
+                    // Inicializa o Dashboard e as Quests após o Auth
                     renderStudentDashboard();
                     renderQuests();
                     document.getElementById('proof-form')?.addEventListener('submit', submitProof);
@@ -77,27 +87,29 @@ async function initializeFirebase() {
  * @param {string} uid ID do usuário
  */
 async function determineUserRole(uid) {
-    // Definimos o Admin por um UID fixo (idealmente, isso viria de um perfil no Firestore)
-    const ADMIN_UID = "admin@fitquest.com"; // Simulação de UID Admin
+    // Definimos o Admin por um UID fixo OU pelo email de simulação.
+    const ADMIN_EMAIL_SIMULATION = "admin@fitquest.com"; 
 
-    if (uid.includes(ADMIN_UID) || (auth.currentUser && auth.currentUser.email === ADMIN_UID)) {
+    // Primeiro, verifica se o usuário autenticado atual é o simulador admin.
+    if (auth.currentUser && auth.currentUser.email === ADMIN_EMAIL_SIMULATION) {
         currentRole = 'admin';
-    } else {
-        // Para fins de simulação, todos os outros usuários autenticados são alunos
-        currentRole = 'student';
+        return;
     }
-
-    // Se o usuário for anônimo (sem token inicial), tentamos buscar o perfil
-    if (auth.currentUser && auth.currentUser.isAnonymous) {
-        // Tenta buscar o perfil do usuário anônimo (fallback seguro)
-        const profileRef = doc(db, getStudentProfilePath(uid));
-        const profileSnap = await getDoc(profileRef);
-        if (profileSnap.exists() && profileSnap.data().role === 'admin') {
+    
+    // Segundo, busca o perfil para verificar o papel real ou o UID do admin simulado.
+    const profileRef = doc(db, getStudentProfilePath(uid));
+    const profileSnap = await getDoc(profileRef);
+    
+    if (profileSnap.exists()) {
+        const profileData = profileSnap.data();
+        if (profileData.role === 'admin') {
             currentRole = 'admin';
-        } else {
-            currentRole = 'student';
+            return;
         }
     }
+    
+    // Se não for admin por email ou pelo perfil, é aluno.
+    currentRole = 'student';
 }
 
 // --- PATH UTILS ---
@@ -217,22 +229,36 @@ function checkAuthAndRedirect() {
 // --- AUTH LOGIC (LOGIN/LOGOUT) ---
 
 /**
- * Tenta fazer login com email e senha.
+ * Tenta fazer login com email e senha (simulado).
  * @param {Event} e 
  */
 async function handleLogin(e) {
     e.preventDefault();
-    const email = document.getElementById('email').value;
-    const password = document.getElementById('password').value;
+    const email = document.getElementById('email').value.trim();
+    // A senha não é usada na simulação, apenas o email
     const errorMessage = document.getElementById('error-message');
 
     errorMessage.classList.add('hidden');
 
     try {
-        await auth.signInWithEmailAndPassword(email, password);
+        if (email === 'admin@fitquest.com') {
+             // Se for o Admin simulado, força o papel e redireciona
+             currentRole = 'admin';
+             checkAuthAndRedirect();
+        } else if (email === 'aluno@fitquest.com') {
+             // Se for o Aluno simulado, força o papel e redireciona
+             currentRole = 'student';
+             checkAuthAndRedirect();
+        } else {
+             // Credenciais de simulação inválidas
+             errorMessage.textContent = "Apenas as contas de teste (admin@fitquest.com ou aluno@fitquest.com) são permitidas.";
+             errorMessage.classList.remove('hidden');
+        }
+
     } catch (error) {
-        console.error("Erro no login:", error);
-        errorMessage.textContent = "Erro de login: E-mail ou senha inválidos.";
+        // Isso não deve mais acontecer, mas mantemos o console.error
+        console.error("Erro inesperado no login simulado:", error);
+        errorMessage.textContent = "Erro inesperado. Verifique o console.";
         errorMessage.classList.remove('hidden');
     }
 }
@@ -276,15 +302,16 @@ function calculateLevel(totalXP) {
  * Busca e renderiza os dados do perfil do aluno (nome, nível, XP).
  */
 async function renderStudentDashboard() {
-    if (!currentUserId) return;
+    if (!currentUserId || !db) return;
 
     const profileRef = doc(db, getStudentProfilePath(currentUserId));
 
     onSnapshot(profileRef, async (docSnap) => {
-        let profile = { name: "Novo Aluno", totalXP: 0 };
+        let profile = { name: `Aluno ${currentUserId.substring(0, 8)}`, totalXP: 0, role: 'student' };
         
         if (!docSnap.exists()) {
             // Cria um perfil inicial se não existir
+            // Usa o currentUserId para garantir a unicidade
             await setDoc(profileRef, profile, { merge: true });
         } else {
             profile = docSnap.data();
@@ -309,6 +336,8 @@ async function renderStudentDashboard() {
  */
 function renderQuests() {
     const questsList = document.getElementById('quests-list');
+    if (!questsList || !db) return;
+
     const questsRef = collection(db, getQuestsCollectionPath());
     
     // Escuta em tempo real as Quests
@@ -403,7 +432,7 @@ function closeProofModal() {
  */
 async function submitProof(e) {
     e.preventDefault();
-    if (!activeQuestId || !currentUserId) return;
+    if (!activeQuestId || !currentUserId || !db) return;
 
     const proofValue = document.getElementById('proof-input').value.trim();
     
@@ -453,6 +482,7 @@ async function submitProof(e) {
  */
 async function createQuest(e) {
     e.preventDefault();
+    if (!db) return;
     
     const name = document.getElementById('quest-name').value.trim();
     const description = document.getElementById('quest-description').value.trim();
@@ -486,6 +516,8 @@ async function createQuest(e) {
  */
 function renderExistingQuests() {
     const listElement = document.getElementById('existing-quests-list');
+    if (!listElement || !db) return;
+
     const questsRef = collection(db, getQuestsCollectionPath());
     
     onSnapshot(questsRef, (snapshot) => {
@@ -524,6 +556,7 @@ function renderExistingQuests() {
  * @param {string} questId 
  */
 async function deleteQuest(questId) {
+    if (!db) return;
     const confirmed = await showConfirmationModal("Tem certeza que deseja deletar esta Quest? Isso é irreversível.");
     if (!confirmed) return;
 
@@ -541,6 +574,8 @@ async function deleteQuest(questId) {
  */
 function renderPendingSubmissions() {
     const listElement = document.getElementById('pending-submissions-list');
+    if (!listElement || !db) return;
+
     const submissionsRef = collection(db, getSubmissionsCollectionPath());
     
     // Query: Apenas submissões com status 'pending'
@@ -555,11 +590,8 @@ function renderPendingSubmissions() {
                 const sub = subDoc.data();
                 const submissionId = subDoc.id;
                 
-                // Busca o nome do aluno (pode ser anônimo no início)
-                let studentName = `Aluno ${sub.studentId.substring(0, 8)}...`;
-                // Poderíamos buscar o nome do perfil aqui, mas para simplificar, usaremos o ID parcial
-                // const profileSnap = await getDoc(doc(db, getStudentProfilePath(sub.studentId)));
-                // if (profileSnap.exists()) { studentName = profileSnap.data().name || studentName; }
+                // Exibe apenas os 8 primeiros caracteres do ID do aluno
+                let studentDisplayId = sub.studentId.substring(0, 8); 
                 
                 let proofDisplay;
                 if (sub.validationType === 'Foto') {
@@ -574,7 +606,7 @@ function renderPendingSubmissions() {
                             <h4 class="text-xl font-bold text-gray-800">${sub.questName}</h4>
                             <span class="text-sm font-bold bg-indigo-100 text-indigo-700 px-3 py-1 rounded-full">+${sub.questXP} XP</span>
                         </div>
-                        <p class="text-sm text-gray-500 mb-3">Aluno ID: <span class="font-mono text-gray-700">${sub.studentId}</span></p>
+                        <p class="text-sm text-gray-500 mb-3">Aluno ID: <span class="font-mono text-gray-700">${studentDisplayId}...</p>
                         <p class="text-gray-600 mb-4">Prova: ${proofDisplay}</p>
                         
                         <div class="flex space-x-3">
@@ -609,6 +641,7 @@ function renderPendingSubmissions() {
  * @param {number} xp XP a ser concedido
  */
 async function approveSubmission(submissionId, studentId, xp) {
+    if (!db) return;
     const confirmed = await showConfirmationModal(`Conceder ${xp} XP ao aluno?`);
     if (!confirmed) return;
 
@@ -616,12 +649,15 @@ async function approveSubmission(submissionId, studentId, xp) {
         const studentProfileRef = doc(db, getStudentProfilePath(studentId));
         const submissionRef = doc(db, getSubmissionsCollectionPath(), submissionId);
 
-        // 1. Atualiza o XP do aluno (uso de transação seria ideal, mas simplificado aqui)
-        await updateDoc(studentProfileRef, {
-            totalXP: getDoc(studentProfileRef).then(doc => (doc.data()?.totalXP || 0) + xp) // Adiciona o XP
-        });
+        // 1. Obtém o XP atual e calcula o novo valor
+        const docSnap = await getDoc(studentProfileRef);
+        const currentXP = docSnap.exists() ? docSnap.data()?.totalXP || 0 : 0;
+        const newXP = currentXP + xp;
+
+        // 2. Atualiza o XP do aluno
+        await setDoc(studentProfileRef, { totalXP: newXP }, { merge: true });
         
-        // 2. Marca a submissão como aprovada
+        // 3. Marca a submissão como aprovada
         await updateDoc(submissionRef, { status: 'approved', approvedAt: new Date().toISOString() });
         
         showMessage(`Submissão aprovada! ${xp} XP concedidos ao aluno.`, "success");
@@ -636,6 +672,7 @@ async function approveSubmission(submissionId, studentId, xp) {
  * @param {string} submissionId ID da submissão
  */
 async function rejectSubmission(submissionId) {
+    if (!db) return;
     const confirmed = await showConfirmationModal("Tem certeza que deseja rejeitar esta submissão?");
     if (!confirmed) return;
 
@@ -645,7 +682,7 @@ async function rejectSubmission(submissionId) {
         // Marca a submissão como rejeitada
         await updateDoc(submissionRef, { status: 'rejected', rejectedAt: new Date().toISOString() });
         
-        showMessage("Submissão rejeitada. O aluno foi notificado.", "info"); // Nota: Notificação não implementada
+        showMessage("Submissão rejeitada.", "info");
     } catch (error) {
         console.error("Erro ao rejeitar submissão:", error);
         showMessage("Erro ao processar rejeição.", "error");
@@ -662,8 +699,13 @@ initializeFirebase();
 document.addEventListener('DOMContentLoaded', () => {
     if (window.location.pathname.endsWith('index.html')) {
         document.getElementById('loginForm')?.addEventListener('submit', handleLogin);
+        // Os botões de simulação agora usam a nova lógica de handleLogin
         document.getElementById('simulateStudentLogin')?.addEventListener('click', () => simulateLogin('aluno@fitquest.com', '123456'));
         document.getElementById('simulateAdminLogin')?.addEventListener('click', () => simulateLogin('admin@fitquest.com', '123456'));
+        
+        // Configuração do modal de confirmação
+        document.getElementById('confirm-yes')?.addEventListener('click', () => handleConfirm(true));
+        document.getElementById('confirm-no')?.addEventListener('click', () => handleConfirm(false));
     }
 });
 
@@ -671,10 +713,8 @@ document.addEventListener('DOMContentLoaded', () => {
 window.fitquest = {
     handleLogout,
     handleConfirm, // Para o modal de confirmação
-    // Student functions
     openProofModal,
     closeProofModal,
-    // Admin functions
     createQuest,
     deleteQuest,
     approveSubmission,
